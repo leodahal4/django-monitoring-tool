@@ -1,0 +1,6 @@
+{
+  "ToxEnv": {
+    "name": "py39-django32",
+    "type": "VirtualEnvRunner"
+  }
+}

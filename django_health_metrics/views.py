@@ -1,199 +1,276 @@
-from prometheus_client import generate_latest, REGISTRY
+from prometheus_client import generate_latest, REGISTRY, Counter, Histogram
+from functools import lru_cache
 from django.http import HttpResponse, JsonResponse
-import redis
-import time
-import psutil
-import threading
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 from django.conf import settings
 from django.db import connections
 from django.core.cache import cache
+import redis
+import psutil
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Callable
+import pika
+import threading
+from elasticsearch import Elasticsearch
+from celery import Celery
+import requests
+
+
+logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_TIMEOUT = getattr(settings, 'HEALTH_METRICS_DEFAULT_TIMEOUT', 2)
+"""Default timeout for network operations in seconds."""
+DEFAULT_THREADS_TIMEOUT = getattr(settings, 'HEALTH_METRICS_THREADS_TIMEOUT', 10)
+"""Default timeout for thread-related operations in seconds."""
+STATUS_HEALTHY = "healthy"
+"""Status string for healthy services."""
+STATUS_UNHEALTHY = "unhealthy"
+"""Status string for unhealthy services."""
+STATUS_NOT_CONNECTED = "not_connected"
+"""Status string for services that are not connected."""
+
+PROMETHEUS_HISOGRAM_ENABLED = getattr(settings, 'PROMETHEUS_HISOGRAM_ENABLED', False)
+"""Flag to enable Prometheus histogram metrics."""
+if PROMETHEUS_HISOGRAM_ENABLED:
+    health_check_latency = Histogram(
+        'health_check_latency_seconds',
+        'Health check latency in seconds',
+        ['service'],
+        buckets=[0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30]
+    )
+    health_check_counter = Counter(
+        'health_check_latency_seconds',
+        'Health check latency in seconds',
+        ['service']
+    )
+"""Prometheus histogram metric for health check latency."""
+
+CHECK_CONFIG = {
+    "redis": {"enabled": "ENABLE_REDIS_CHECK", "requires": ["REDIS_HOST", "REDIS_PORT", "REDIS_DB"]},
+    "database": {"enabled": "ENABLE_DB_CHECK", "requires": []},
+    "cache": {"enabled": "ENABLE_CACHE_CHECK", "requires": []},
+    "custom_urls": {"enabled": "CUSTOM_URLS_TO_CHECK", "requires": []},
+    "rabbitmq": {"enabled": "ENABLE_RABBITMQ_CHECK", "requires": ["RABBITMQ_HOST"]},
+    "elasticsearch": {"enabled": "ENABLE_ELASTICSEARCH_CHECK", "requires": ["ELASTICSEARCH_HOST"]},
+    "celery": {"enabled": "ENABLE_CELERY_CHECK", "requires": ["CELERY_BROKER_URL"]},
+}
+"""Configuration for optional health checks with their enabling flags and required settings."""
+
+class HealthChecker:
+    """A class to manage and execute health checks for various services.
+
+    Attributes:
+        redis_client (redis.Redis): Reusable Redis client instance.
+        es_client (Elasticsearch): Reusable Elasticsearch client instance.
+        celery_app (Celery): Reusable Celery app instance.
+    """
+
+    def __init__(self):
+        self.redis_client = None
+        self.es_client = None
+        self.celery_app = None
+        self._requests_session = requests.Session()  # Reusable HTTP session for custom URLs
+        retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retries)
+        self._requests_session.mount('http://', adapter)
+        self._requests_session.mount('https://', adapter)
+
+    def _get_redis_client(self) -> redis.Redis:
+        """Lazily initialize and return a Redis client."""
+        if not self.redis_client:
+            self.redis_client = redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                decode_responses=True,
+                socket_timeout=DEFAULT_TIMEOUT
+            )
+        return self.redis_client
+
+    def _get_es_client(self) -> Elasticsearch:
+        """Lazily initialize and return an Elasticsearch client."""
+        if not self.es_client:
+            self.es_client = Elasticsearch([settings.ELASTICSEARCH_HOST], timeout=DEFAULT_TIMEOUT)
+        return self.es_client
+
+    def _get_celery_app(self) -> Celery:
+        """Lazily initialize and return a Celery app."""
+        if not self.celery_app:
+            self.celery_app = Celery(broker=settings.CELERY_BROKER_URL)
+        return self.celery_app
+
+    def run_check(self, check_func: Callable, *args, **kwargs) -> Dict:
+        """Execute a health check function and measure its response time.
+
+        Args:
+            check_func: The health check function to execute.
+            *args: Positional arguments for the check function.
+            **kwargs: Keyword arguments for the check function.
+
+        Returns:
+            Dict containing the check result with response time in milliseconds.
+        """
+        service_name = check_func.__name__.replace("check_", "")
+        try:
+            start = time.perf_counter()  # Higher precision than time.time()
+            result = check_func(*args, **kwargs)
+            response_time = (time.perf_counter() - start) * 1000
+            if PROMETHEUS_HISOGRAM_ENABLED:
+                health_check_latency.labels(service=service_name).observe(response_time)
+                health_check_counter.labels(service=service_name, status="healthy").inc()
+            return {"status": STATUS_HEALTHY, "response_time_ms": response_time, **(result or {})}
+        except Exception as e:
+            logger.error(f"Error in {check_func.__name__}: {e}")
+            return {"status": STATUS_UNHEALTHY, "message": str(e), "response_time_ms": 0}
+
+    @lru_cache(maxsize=None)
+    def _is_configured(self, check_name: str) -> bool:
+        """Check if a service is configured and enabled.
+
+        Args:
+            check_name: The name of the check (e.g., 'redis', 'database').
+
+        Returns:
+            True if the service is enabled and all required settings are present, False otherwise.
+        """
+        config = CHECK_CONFIG.get(check_name, {})
+        enabled = getattr(settings, config.get("enabled", ""), False)
+        if not enabled:
+            return False
+        return all(hasattr(settings, req) for req in config.get("requires", []))
+
+    def check_redis(self) -> Dict:
+        """Check Redis connectivity."""
+        if not self._is_configured("redis"):
+            return {"status": "not_connected"}
+        self._get_redis_client().ping()
+        return {}
+
+    def check_database(self) -> Dict:
+        """Check database connectivity."""
+        if not self._is_configured("database"):
+            return {"status": "not_connected"}
+        connections['default'].cursor()
+        return {}
+
+    def check_cache(self) -> Dict:
+        """Check cache read/write functionality."""
+        if not self._is_configured("cache"):
+            return {"status": "not_connected"}
+        cache.set('health_check', 'ok', timeout=1)
+        return {} if cache.get('health_check') == 'ok' else {"message": "Cache read/write failed"}
+
+    def check_custom_urls(self) -> Dict:
+        """Check the health of custom URLs in parallel."""
+        urls = getattr(settings, 'CUSTOM_URLS_TO_CHECK', [])
+        if not urls:
+            return {"status": "None Provided"}
+        
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(len(urls), 5)) as executor:
+            future_to_url = {
+                executor.submit(self._requests_session.get, url, timeout=DEFAULT_TIMEOUT): url
+                for url in urls
+            }
+            for future in future_to_url:
+                url = future_to_url[future]
+                try:
+                    response = future.result()
+                    results[url] = {} if response.status_code == 200 else {
+                        "message": f"HTTP {response.status_code}"
+                    }
+                except Exception as e:
+                    results[url] = {"message": str(e)}
+        return {"urls": results}
+
+    def check_memory(self) -> Dict:
+        """Check system memory usage."""
+        memory = psutil.virtual_memory()
+        return {"total": memory.total, "available": memory.available, "percent": memory.percent}
+
+    def check_cpu(self) -> Dict:
+        """Check CPU usage."""
+        return {"cpu_percent": psutil.cpu_percent(interval=0.1)}  # Reduced interval for faster response
+
+    def check_threads(self) -> Dict:
+        """Check active thread count."""
+        return {"total_threads": threading.active_count()}
+
+    def check_rabbitmq(self) -> Dict:
+        """Check RabbitMQ connectivity."""
+        if not self._is_configured("rabbitmq"):
+            return {"status": "not_connected"}
+        connection = pika.BlockingConnection(
+            pika.ConnectionParameters(host=settings.RABBITMQ_HOST, socket_timeout=DEFAULT_TIMEOUT)
+        )
+        connection.close()
+        return {}
+
+    def check_elasticsearch(self) -> Dict:
+        """Check Elasticsearch connectivity."""
+        if not self._is_configured("elasticsearch"):
+            return {"status": "not_connected"}
+        return {} if self._get_es_client().ping() else {"message": "Elasticsearch ping failed"}
+
+    def check_celery(self) -> Dict:
+        """Check Celery worker availability."""
+        if not self._is_configured("celery"):
+            return {"status": "not_connected"}
+        result = self._get_celery_app().control.ping(timeout=DEFAULT_TIMEOUT)
+        return {} if result else {"message": "No workers responded"}
+
+checker = HealthChecker()
 
 def metrics_view(request):
+    """Expose Prometheus metrics.
+
+    Args:
+        request: The Django HTTP request object.
+
+    Returns:
+        HttpResponse with Prometheus metrics in text/plain format.
+    """
     return HttpResponse(generate_latest(REGISTRY), content_type='text/plain')
 
-def check_redis():
-    if not getattr(settings, 'ENABLE_REDIS_CHECK', False):
-        return None
-    try:
-        start = time.time()
-        r = redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            db=settings.REDIS_DB
-        )
-        r.ping()
-        end = time.time()
-        return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-    except redis.ConnectionError:
-        return {"status": "unhealthy", "message": "Cannot connect to Redis"}
-
-def check_database():
-    if not getattr(settings, 'ENABLE_DB_CHECK', False):
-        return None
-    try:
-        start = time.time()
-        connections['default'].cursor()
-        end = time.time()
-        return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_cache():
-    if not getattr(settings, 'ENABLE_CACHE_CHECK', False):
-        return None
-    try:
-        start = time.time()
-        cache.set('health_check', 'ok', timeout=1)
-        value = cache.get('health_check')
-        end = time.time()
-        if value == 'ok':
-            return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-        else:
-            return {"status": "unhealthy", "message": "Cache read/write failed"}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_elasticsearch():
-    if not getattr(settings, 'ENABLE_ELASTICSEARCH_CHECK', False):
-        return None
-    try:
-        from elasticsearch import Elasticsearch
-        start = time.time()
-        es = Elasticsearch(settings.ELASTICSEARCH_HOST)
-        if es.ping():
-            end = time.time()
-            return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-        else:
-            return {"status": "unhealthy", "message": "Elasticsearch ping failed"}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_rabbitmq():
-    if not getattr(settings, 'ENABLE_RABBITMQ_CHECK', False):
-        return None
-    try:
-        import pika
-        start = time.time()
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host=settings.RABBITMQ_HOST))
-        connection.close()
-        end = time.time()
-        return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_celery():
-    if not getattr(settings, 'ENABLE_CELERY_CHECK', False):
-        return None
-    try:
-        from celery import Celery
-        start = time.time()
-        app = Celery(broker=settings.CELERY_BROKER_URL)
-        result = app.control.ping(timeout=1)
-        end = time.time()
-        if result:
-            return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-        else:
-            return {"status": "unhealthy", "message": "Celery workers not responding"}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_mongodb():
-    if not getattr(settings, 'ENABLE_MONGODB_CHECK', False):
-        return None
-    try:
-        from pymongo import MongoClient
-        start = time.time()
-        client = MongoClient(settings.MONGODB_URI, serverSelectionTimeoutMS=1000)
-        client.admin.command('ping')
-        end = time.time()
-        return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_django_cache():
-    if not getattr(settings, 'ENABLE_DJANGO_CACHE_CHECK', False):
-        return None
-    try:
-        start = time.time()
-        cache.set('django_cache_health_check', 'ok', timeout=1)
-        value = cache.get('django_cache_health_check')
-        end = time.time()
-        if value == 'ok':
-            return {"status": "healthy", "response_time_ms": (end - start) * 1000}
-        else:
-            return {"status": "unhealthy", "message": "Django cache read/write failed"}
-    except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
-
-def check_custom_urls():
-    if not getattr(settings, 'CUSTOM_URLS_TO_CHECK', []):
-        return None
-    results = {}
-    import requests
-    for url in settings.CUSTOM_URLS_TO_CHECK:
-        try:
-            start = time.time()
-            response = requests.get(url, timeout=2)
-            end = time.time()
-            if response.status_code == 200:
-                results[url] = {"status": "healthy", "response_time_ms": (end - start) * 1000}
-            else:
-                results[url] = {"status": "unhealthy", "message": f"HTTP {response.status_code}"}
-        except Exception as e:
-            results[url] = {"status": "unhealthy", "message": str(e)}
-    return results
-
-def check_memory():
-    memory = psutil.virtual_memory()
-    return {"total": memory.total, "available": memory.available, "percent": memory.percent}
-
-def check_cpu():
-    return {"cpu_percent": psutil.cpu_percent(interval=1)}
-
-def check_threads():
-    return {"total_threads": threading.active_count()}
-
 def health_view(request):
-    health_checks = {}
+    """Perform health checks on configured services and return their status.
 
-    redis_check = check_redis()
-    if redis_check:
-        health_checks["redis"] = redis_check
+    Args:
+        request: The Django HTTP request object.
 
-    db_check = check_database()
-    if db_check:
-        health_checks["database"] = db_check
+    Returns:
+        JsonResponse containing the health status of all services.
+    """
+    checks = {
+        "redis": checker.check_redis,
+        "database": checker.check_database,
+        "cache": checker.check_cache,
+        "custom_urls": checker.check_custom_urls,
+        "memory": checker.check_memory,
+        "cpu": checker.check_cpu,
+        "threads": checker.check_threads,
+        "rabbitmq": checker.check_rabbitmq,
+        "elasticsearch": checker.check_elasticsearch,
+        "celery": checker.check_celery,
+    }
 
-    cache_check = check_cache()
-    if cache_check:
-        health_checks["cache"] = cache_check
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(checks), 10)) as executor:
+        future_to_check = {executor.submit(checker.run_check, func): name for name, func in checks.items()}
+        for future in future_to_check:
+            try:
+                name = future_to_check[future]
+                result = future.result(timeout=DEFAULT_THREADS_TIMEOUT)
+                results[name] = result if result["status"] == STATUS_NOT_CONNECTED else {
+                    "status": STATUS_HEALTHY if result.get("status") != STATUS_UNHEALTHY else STATUS_UNHEALTHY,
+                    **result
+                }
+            except Exception as e:
+                logger.error(f"Error in health check: {e}")
+                results[name] = {"status": STATUS_UNHEALTHY, "message": str(e), "response_time_ms": 0}
 
-    elasticsearch_check = check_elasticsearch()
-    if elasticsearch_check:
-        health_checks["elasticsearch"] = elasticsearch_check
-
-    rabbitmq_check = check_rabbitmq()
-    if rabbitmq_check:
-        health_checks["rabbitmq"] = rabbitmq_check
-
-    celery_check = check_celery()
-    if celery_check:
-        health_checks["celery"] = celery_check
-
-    mongodb_check = check_mongodb()
-    if mongodb_check:
-        health_checks["mongodb"] = mongodb_check
-
-    django_cache_check = check_django_cache()
-    if django_cache_check:
-        health_checks["django_cache"] = django_cache_check
-
-    custom_urls_check = check_custom_urls()
-    if custom_urls_check:
-        health_checks["custom_urls"] = custom_urls_check
-
-    health_checks["memory"] = check_memory()
-    health_checks["cpu"] = check_cpu()
-    health_checks["threads"] = check_threads()
-
-    return JsonResponse(health_checks)
+    return JsonResponse(results)

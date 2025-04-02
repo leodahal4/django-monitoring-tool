@@ -1,0 +1,9 @@
+Django>=3.2
+prometheus-client
+psutil
+redis
+elasticsearch
+pika
+celery
+pymongo
+requests
