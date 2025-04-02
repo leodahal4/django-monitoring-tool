@@ -1,3 +1,4 @@
 include README.md
 include LICENSE
-recursive-include health *
+recursive-include django_health_metrics *.py
+recursive-include docs *.md

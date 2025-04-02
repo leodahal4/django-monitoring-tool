@@ -16,7 +16,7 @@ Django Health Metrics is a Django app that provides `/metrics` and `/health` end
    ```python
    INSTALLED_APPS = [
        # ...existing apps...
-       'health',
+       'django_health_metrics',
    ]
    ```
 
@@ -26,7 +26,7 @@ Django Health Metrics is a Django app that provides `/metrics` and `/health` end
 
    urlpatterns = [
        # ...existing URLs...
-       path('health-metrics/', include('health.urls')),
+       path('health-metrics/', include('django_health_metrics.urls')),
    ]
    ```
 
@@ -67,7 +67,7 @@ Django Health Metrics is a Django app that provides `/metrics` and `/health` end
 ## Usage
 Once installed and configured, you can use the following endpoints:
 
-- **Health Check Endpoint**: Access the `/health` endpoint to get a JSON response with the status of various health checks (Redis, database, memory, CPU, threads, Elasticsearch, RabbitMQ, Celery, MongoDB, Django cache, and custom URLs). Example:
+- **Health Check Endpoint**: Access the `/health-metrics/health` endpoint to get a JSON response with the status of various health checks (Redis, database, memory, CPU, threads, Elasticsearch, RabbitMQ, Celery, MongoDB, Django cache, and custom URLs). Example:
   ```bash
   curl http://127.0.0.1:8000/health-metrics/health/
   ```
@@ -99,6 +99,19 @@ Once installed and configured, you can use the following endpoints:
   ```
 
   This will return Prometheus-compatible metrics for integration with monitoring tools.
+
+## Contributing
+1. Fork the repository.
+2. Create a new branch: `git checkout -b feature-name`.
+3. Make your changes and write tests.
+4. Run tests: `pytest`.
+5. Submit a pull request.
+
+## Development Setup
+1. Clone the repo: `git clone https://github.com/leodahal4/django-health-metrics.git`
+2. Install dependencies: `pip install -r requirements.txt`
+3. Run the example project: `cd example && python manage.py runserver`
+
 
 ## License
 This project is licensed under the MIT License.
